@@ -162,10 +162,10 @@ static int   sys_sync(CozyFS *fs);
 static u64   sys_time(CozyFS *fs);
 
 // Relative pointer management
-const RPage*       get_root(CozyFS *fs);
-static const void* off2ptr(CozyFS *fs, Offset off);
-static Offset      ptr2off(CozyFS *fs, const void *ptr);
-static void*       writable_addr(CozyFS *fs, const void *ptr);
+static const RPage* get_root(CozyFS *fs);
+static const void*  off2ptr(CozyFS *fs, Offset off);
+static Offset       ptr2off(CozyFS *fs, const void *ptr);
+static void*        writable_addr(CozyFS *fs, const void *ptr);
 
 // Directory and file management
 static Entity*       find_unused_entity(CozyFS *fs);
@@ -228,9 +228,9 @@ static u64 atomic_load(volatile u64 *ptr)
 static void atomic_store(volatile u64 *ptr, u64 val)
 {
 #if COMPILER_MSVC
-	_InterlockedExchange64((volatile s64*) ptr, 0);
+	_InterlockedExchange64((volatile s64*) ptr, val);
 #elif COMPILER_GCC || COMPILER_CLANG
-	__atomic_store_n(ptr, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(ptr, val, __ATOMIC_RELEASE);
 #endif
 }
 
@@ -332,7 +332,7 @@ static u64 sys_time(CozyFS *fs)
 // Relative pointer management
 
 // TODO: Use this instead of accessing the root page directly
-const RPage *get_root(CozyFS *fs)
+static const RPage *get_root(CozyFS *fs)
 {
 	RPage *root = fs->mem;
 	if (root->backup == BACKUP_HALF_INACTIVE)

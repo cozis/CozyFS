@@ -18,6 +18,16 @@
 
 #include "cozyfs.h"
 
+#if defined(__linux__)
+static int futex(unsigned int *uaddr,
+	int futex_op, unsigned int val,
+	const struct timespec *timeout,
+	unsigned int *uaddr2, unsigned int val3)
+{
+	return syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
+}
+#endif
+
 static int wait(u64 *word, u64 old_word, int timeout_ms)
 {
 #if defined(_WIN32)

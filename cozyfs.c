@@ -195,6 +195,48 @@ typedef struct {
 	Handle handles[8];
 } RPage;
 
+
+static void *sys_malloc(CozyFS *fs, int len)
+{
+	return (void*) fs->callback(COZYFS_SYSOP_MALLOC, fs->userptr, NULL, len);
+}
+
+static int sys_free(CozyFS *fs, void *ptr, int len)
+{
+	// We ignore the return value here
+	if (!fs->callback(COZYFS_SYSOP_FREE, fs->userptr, ptr, len))
+		return -COZYFS_ESYSFREE;
+	return COZYFS_OK;
+}
+
+static int sys_wait(CozyFS *fs, u64 *word, u64 old_word, int timeout_ms)
+{
+	int code = fs->callback(COZYFS_SYSOP_WAIT, fs->userptr, ???);
+	if (code != COZYFS_SYSRES_OK)
+		return NULL;
+	return COZYFS_OK;
+}
+
+static int sys_wake(CozyFS *fs, u64 *word)
+{
+	int code = fs->callback(COZYFS_SYSOP_WAKE, fs->userptr, ???);
+	if (code != COZYFS_SYSRES_OK)
+		return NULL;
+	return COZYFS_OK;
+}
+
+static int sys_sync(CozyFS *fs)
+{
+	if (!fs->callback(COZYFS_SYSOP_SYNC, fs->userptr, NULL, 0))
+		return -COZYFS_ESYSSYNC;
+	return COZYFS_OK;
+}
+
+static u64 sys_time(CozyFS *fs)
+{
+	return fs->callback(COZYFS_SYSOP_TIME, fs->userptr, NULL, 0);
+}
+
 static Entity *find_unused_entity(CozyFS *fs)
 {
 	// First, look in the already modified pages
@@ -442,6 +484,132 @@ static int atomic_compare_exchange(volatile u64 *ptr, u64 expect, u64 new_value)
 #endif
 }
 
+#if defined(__linux__)
+static int futex(unsigned int *uaddr,
+	int futex_op, unsigned int val,
+	const struct timespec *timeout,
+	unsigned int *uaddr2, unsigned int val3)
+{
+	return syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
+}
+#endif
+
+u64 load(u64 *ptr)
+{
+#if COMPILER_MSVC
+	u64 old_word = *ptr;
+#else
+	u64 old_word = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+#endif
+}
+
+int cmpxchg_acquire(u64 *word, u64 new_word, u64 old_word)
+{
+#if defined(_MSC_VER)
+	return (u64) _InterlockedCompareExchange64((volatile s64*) word, new_word, old_word) == old_word;
+#else
+	return __atomic_compare_exchange_n(word, &old_word, new_word, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+#endif
+}
+
+int cmpxchg_release(u64 *word, u64 new_word, u64 old_word)
+{
+#if defined(_MSC_VER)
+	return (u64) _InterlockedCompareExchange64((volatile s64*) word, new_word, old_word) == old_word
+#else
+	return __atomic_compare_exchange_n(word, &old_word, new_word, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+#endif
+}
+
+int cmpxchg_acq_rel(u64 *word, u64 new_word, u64 old_word)
+{
+#if defined(_MSC_VER)
+	return (u64) _InterlockedCompareExchange64((volatile s64*) word, new_word, old_word) == old_word
+#else
+	return __atomic_compare_exchange_n(word, &old_word, new_word, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+#endif
+}
+
+void fence(void)
+{
+	// TODO
+}
+
+static int lock(CozyFS *fs, int wait_timeout_ms, int acquire_timeout_sec, int *crash)
+{
+	u64 start = sys_time(fs);
+	if (start == 0)
+		return -COZYFS_ESYSTIME;
+
+	RPage *root = fs->mem;
+	u64   *word = root->lock;
+	u64 old_word;
+	u64 new_word;
+	for (;;) {
+
+		u64 now = sys_time(fs);
+		if (now == 0)
+			return -COZYFS_ESYSTIME;
+
+		old_word = load(word);
+		new_word = now + acquire_timeout_sec * 1000;
+
+		if (old_word < now) {
+			// Region is unlocked. Try locking it.
+			if (cmpxchg_acq(word, new_word, old_word))
+				break; // Lock acquired
+			// If we reach this point, probably someone
+			// else got the lock. We don't need to wait
+			// before trying again.
+		} else {
+			int code = sys_wait(fs, word, old_word, old_word - now);
+			if (code < 0)
+				return code;
+		}
+
+		// Don't wait more than "wait_timeout_ms"
+		if (wait_timeout_ms >= 0 && now - start >= wait_timeout_ms)
+			return -COZYFS_ETIMEDOUT;
+	}
+
+	fs->ticket = new_word;
+
+	if (old_word > 0) {
+		fence(); // If a crash happened, we missed the memory barriers from the unlock operation
+		*crash = 1;
+	} else
+		*crash = 0;
+	return 0;
+}
+
+static int unlock(CozyFS *fs)
+{
+	RPage *root = fs->mem;
+	u64   *word = root->lock;
+	if (!cmpxchg_rel(root->lock, 0, fs->ticket))
+		return -COZYFS_ETIMEDOUT;
+	return sys_wake(fs, word); // TODO: Should I only wake up 1?
+}
+
+static int refresh_lock(CozyFS *fs, int postpone_sec)
+{
+	u64 now = sys_time(fs);
+	if (now == 0)
+		return -COZYFS_ESYSTIME;
+
+	RPage *root = fs->mem;
+
+	u64 *word = root->lock;
+	u64 new_word = now + postpone_sec * 1000;
+	u64 old_word = fs->ticket;
+
+	if (!cmpxchg_acq_rel(word, new_word, fs->ticket))
+		return -COZYFS_ETIMEDOUT;
+	
+	fs->ticket = new_word;
+	return 0;
+}
+
 static int restore_backup(CozyFS *fs)
 {
 	const RPage *root = fs->mem;
@@ -449,7 +617,7 @@ static int restore_backup(CozyFS *fs)
 	int backup = atomic_load(&root->backup);
 	if (backup == BACKUP_NO)
 		return 0;
-	
+
 	// Copy the inactive region into the active
 	// (and corrupted) one. Don't copy the volatile
 	// fields though.
@@ -483,80 +651,6 @@ static void perform_backup(CozyFS *fs, int not_before_sec)
 	atomic_store(&root->last_backup_time, now);
 }
 
-static int trylock(CozyFS *fs, int acquire_timeout_sec, int *timedout)
-{
-	RPage *root = fs->mem;
-
-	u64 current = atomic_load(&root->lock);
-
-	if (current == 1)
-		return -COZYFS_EBUSY; // Locked with no timeout
-
-	u64 now = timestamp_utc();
-
-	// Try acquiring the lock if it timed out
-	if (current < now) {
-		if (!atomic_compare_exchange(&root->lock, current, now + acquire_timeout_sec))
-			return -COZYFS_EBUSY;
-		return COZYFS_OK;
-	}
-
-	// Lock didn't expire yet
-	return -COZYFS_EBUSY;
-}
-
-static void unlock(CozyFS *fs)
-{
-	RPage *root = fs->mem;
-
-	atomic_store(&root->lock, 0);
-	fs->timeout = atomic_load(&root->lock);
-}
-
-static int refresh_lock(CozyFS *fs, int postpone_sec)
-{
-	RPage *root = fs->mem;
-
-	u64 now = timestamp_utc(fs);
-	if (!atomic_compare_exchange(&root->lock, fs->timeout, now + postpone_sec)) {
-		// Timed out
-		fs->timeout = 0;
-		return -COZYFS_ETIMEOUT;
-	}
-
-	// Lock refreshed
-	fs->timeout = now + postpone_sec;
-	return COZYFS_OK;
-}
-
-static int enter_critical_section(CozyFS *fs)
-{
-	if (fs->transaction == TRANSACTION_TIMEOUT)
-		return -COZYFS_ETIMEOUT;
-
-	if (fs->transaction == TRANSACTION_ON_WITH_LOCK) {
-		int code = refresh_lock(fs, 5);
-		if (code != COZYFS_OK) {
-			fs->transaction == TRANSACTION_TIMEOUT;
-			return code;
-		}
-	} else {
-		int timedout;
-		int code = trylock(fs, 5, &timedout);
-		if (code != COZYFS_OK)
-			return code;
-
-		// We entered the critical section because previous
-		// acquire timed out. We must assume the state is
-		// invalid.
-		if (timedout)
-			if (!restore_backup(fs))
-				return -COZYFS_ECORRUPT;
-	}
-
-	return COZYFS_OK;
-}
-
 // TODO: Use this instead of accessing the root page directly
 const RPage *get_root(CozyFS *fs)
 {
@@ -564,6 +658,42 @@ const RPage *get_root(CozyFS *fs)
 	if (root->backup == BACKUP_HALF_INACTIVE)
 		root += root->tot_pages;
 	return root;
+}
+
+static int enter_critical_section(CozyFS *fs, int wait_timeout_ms)
+{
+	if (fs->transaction == TRANSACTION_TIMEOUT)
+		return -COZYFS_ETIMEDOUT;
+
+	int code;
+	if (fs->transaction == TRANSACTION_ON_WITH_LOCK) {
+
+		code = refresh_lock(fs, 5);
+		if (code != COZYFS_OK) {
+			fs->transaction == TRANSACTION_TIMEOUT;
+			return code;
+		}
+
+	} else {
+
+		int crash;
+		code = lock(fs, wait_timeout_ms, 5, &crash);
+		if (code != COZYFS_OK)
+			return code;
+
+		// We entered the critical section because previous
+		// acquire timed out. We must assume the state is
+		// invalid.
+		if (crash) {
+			code = restore_backup(fs);
+			if (code < 0) {
+				unlock(fs);
+				return code;
+			}
+		}
+	}
+
+	return COZYFS_OK;
 }
 
 static void leave_critical_section(CozyFS *fs)
@@ -609,14 +739,17 @@ void cozyfs_init(void *mem, unsigned long len, int backup)
 		my_memcpy(root + tot_pages, root, tot_pages * 4096);
 }
 
-void cozyfs_attach(CozyFS *fs, void *mem, unsigned long len)
+void cozyfs_attach(CozyFS *fs, void *mem, cozyfs_callback callback, void *userptr)
 {
 	// Align to the size of a pointer
 	{
 		// TODO
 	}
 
-	fs->mem = mem;
+	fs->mem         = mem;
+	fs->userptr     = userptr;
+	fs->callback    = callback;
+	fs->ticket      = 0;
 	fs->transaction = TRANSACTION_OFF;
 	fs->patch_count = 0;
 }
@@ -625,7 +758,7 @@ void cozyfs_idle(CozyFS *fs)
 {
 	if (fs->transaction == TRANSACTION_ON_WITH_LOCK)
 		refresh_lock(fs, 5);
-	maybe_perform_backup(fs);
+	perform_backup(fs, 3);
 }
 
 static int parse_path(string path, string *comps, int max)
@@ -716,7 +849,7 @@ static int link(CozyFS *fs, const char *oldpath, const char *newpath)
 int cozyfs_link(CozyFS *fs, const char *oldpath, const char *newpath)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 
@@ -752,7 +885,7 @@ static int unlink(CozyFS *fs, const char *path)
 int cozyfs_unlink(CozyFS *fs, const char *path)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 
@@ -788,7 +921,7 @@ static int mkdir(CozyFS *fs, const char *path)
 int cozyfs_mkdir(CozyFS *fs, const char *path)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 
@@ -824,7 +957,7 @@ static int rmdir(CozyFS *fs, const char *path)
 int cozyfs_rmdir(CozyFS *fs, const char *path)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 
@@ -858,16 +991,20 @@ int cozyfs_transaction_commit(CozyFS *fs)
 
 		// Free patches
 		for (int i = 0; i < fs->patch_count; i++) {
-			sys_free(fs, fs->patch_ptrs[i]);
+			sys_free(fs, fs->patch_ptrs[i], 4096);
 		}
 		fs->patch_count = 0;
-		return -COZYFS_ETIMEOUT;
+		return -COZYFS_ETIMEDOUT;
 	}
 
 	if (fs->transaction != TRANSACTION_ON_WITH_LOCK) {
-		int code = lock(fs);
+		int crash;
+		int code = lock(fs, -1, 3, &crash);
 		if (code != COZYFS_OK)
 			return code;
+		if (crash) {
+			// TODO
+		}
 	}
 
 	// TODO: Verify conflicts
@@ -893,7 +1030,7 @@ int cozyfs_transaction_rollback(CozyFS *fs)
 
 	// Discard changes
 	for (int i = 0; i < fs->patch_count; i++)
-		sys_free(fs->patch_ptrs[i]);
+		sys_free(fs, fs->patch_ptrs[i], 4096);
 	fs->patch_count = 0;
 
 	if (fs->transaction == TRANSACTION_ON_WITH_LOCK)
@@ -960,6 +1097,7 @@ static int open(CozyFS *fs, const char *path)
 	if (handle == NULL)
 		return -COZYFS_ENOMEM;
 
+	// TODO: Handles should have an expiration or crashing processes will fill up the array
 	handle->entity = ptr2off(fs, entity);
 	handle->used = 1;
 
@@ -969,7 +1107,7 @@ static int open(CozyFS *fs, const char *path)
 int cozyfs_open(CozyFS *fs, const char *path)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 
@@ -1008,7 +1146,7 @@ static int close(CozyFS *fs, int fd)
 int cozyfs_close(CozyFS *fs, int fd)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 
@@ -1088,7 +1226,7 @@ static int read(CozyFS *fs, int fd, void *dst, int max, int flags)
 int cozyfs_read(CozyFS *fs, int fd, void *dst, int max, int flags)
 {
 	int code;
-	code = enter_critical_section(fs);
+	code = enter_critical_section(fs, -1);
 	if (code != COZYFS_OK)
 		return code;
 

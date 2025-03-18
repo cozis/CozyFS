@@ -34,25 +34,47 @@ enum {
 	COZYFS_EISDIR,
 	COZYFS_ENFILE,
 	COZYFS_EBADF,
-	COZYFS_ETIMEOUT,
+	COZYFS_ETIMEDOUT,
 	COZYFS_ECORRUPT,
+	COZYFS_ESYSFREE,
+	COZYFS_ESYSSYNC,
+	COZYFS_ESYSTIME,
 };
 
 enum {
 	COZYFS_FCONSUME = 1 << 0,
 };
 
+enum {
+	COZYFS_SYSOP_MALLOC,
+	COZYFS_SYSOP_FREE,
+	COZYFS_SYSOP_WAIT,
+	COZYFS_SYSOP_WAKE,
+	COZYFS_SYSOP_SYNC,
+	COZYFS_SYSOP_TIME,
+};
+
+enum {
+	COZYFS_SYSRES_OK,
+	COZYFS_SYSRES_ERROR,
+	COZYFS_SYSRES_UNDEFINED,
+};
+
+typedef unsigned long long (*cozyfs_callback)(int sysop, void *userptr, void *p, int n);
+
 typedef struct {
 	const void*        mem;
-	unsigned long long timeout;
+	void*              userptr;
+	cozyfs_callback    callback;
+	unsigned long long ticket;
 	int                transaction;
 	int                patch_count;
 	unsigned int       patch_offs[COZYFS_MAX_PATCHES];
 	void*              patch_ptrs[COZYFS_MAX_PATCHES];
 } CozyFS;
 
-void cozyfs_init(void *mem, unsigned long len);
-void cozyfs_attach(CozyFS *fs, void *mem, unsigned long len);
+void cozyfs_init(void *mem, unsigned long len, int backup);
+void cozyfs_attach(CozyFS *fs, void *mem, cozyfs_callback callback, void *userptr);
 void cozyfs_idle(CozyFS *fs);
 
 int  cozyfs_link(CozyFS *fs, const char *oldpath, const char *newpath);

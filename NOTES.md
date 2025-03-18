@@ -1,4 +1,3 @@
-
 CozyFS is a serialization-friendly in-memory file system that supports crash recovery,
 transactions, and zero-copy operations. You can back it up with a memory-mapped file to
 offer ACID guarantees.

@@ -40,9 +40,13 @@ typedef unsigned int       u32;
 typedef unsigned long long u64;
 typedef long long          s64;
 
-#define COUNT(X) sizeof(X)/sizeof((X)[0])
 #define NULL ((void*) 0)
+
+#define COUNT(X) sizeof(X)/sizeof((X)[0])
+
 #define OFFSETOF(TYPE, MEMBER) (((TYPE*) 0)->MEMBER)
+#define MEMBER_SIZEOF(TYPE, MEMBER) sizeof(((TYPE*) 0)->MEMBER)
+
 #define ASSERT(X) if (!(X)) __builtin_trap();
 #define STATIC_ASSERT(X) _Static_assert(X);
 
@@ -73,12 +77,11 @@ enum {
 	BACKUP_HALF_INACTIVE = 0,
 };
 
-#define MAX_NAME 256 // TODO
-
 typedef struct {
 	Offset off;
 	u8     name[128];
 } Link;
+#define MAX_NAME MEMBER_SIZEOF(Link, name)
 
 typedef struct {
 	u32    refs;

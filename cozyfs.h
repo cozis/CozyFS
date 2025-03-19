@@ -70,7 +70,7 @@ typedef struct {
 	void*              patch_ptrs[COZYFS_MAX_PATCHES];
 } CozyFS;
 
-void cozyfs_init(void *mem, unsigned long len, int backup);
+int  cozyfs_init(void *mem, unsigned long len, int backup, int refresh);
 void cozyfs_attach(CozyFS *fs, void *mem, cozyfs_callback callback, void *userptr);
 void cozyfs_idle(CozyFS *fs);
 

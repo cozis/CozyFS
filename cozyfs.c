@@ -93,7 +93,13 @@ typedef struct {
 } Entity;
 
 typedef struct {
-	
+
+	u32 gen;
+	u32 flags;
+
+	Offset global_prev;
+	Offset global_next;
+
 	// Linked lists of dpages for a directory
 	Offset prev;
 	Offset next;
@@ -113,10 +119,12 @@ STATIC_ASSERT(sizeof(DPage) == 4096);
 
 typedef struct {
 
+	u32 gen;
+
 	Offset prev;
 	Offset next;
 
-	char data[4088];
+	char data[4084];
 
 } FPage;
 STATIC_ASSERT(sizeof(FPage) == 4096);
@@ -129,13 +137,19 @@ typedef struct {
 } Handle;
 
 typedef struct {
+	u32 gen;
+
 	volatile u64 lock;
 	volatile int backup; // All volatile fields must come before "backup"
+
 	u64 last_backup_time;
-	Offset free_dpages;
+
+	Offset dpages;
 	Offset free_pages;
+
 	int tot_pages;
 	int num_pages;
+
 	Entity root;
 	Handle handles[8];
 } RPage;
@@ -199,7 +213,7 @@ static int  restore_backup(CozyFS *fs);
 // Public and thread-safe interface
 static int  enter_critical_section(CozyFS *fs, int wait_timeout_ms);
 static void leave_critical_section(CozyFS *fs);
-void        cozyfs_init(void *mem, unsigned long len, int backup);
+int         cozyfs_init(void *mem, unsigned long len, int backup, int refresh);
 void        cozyfs_attach(CozyFS *fs, void *mem, cozyfs_callback callback, void *userptr);
 void        cozyfs_idle(CozyFS *fs);
 int         cozyfs_link(CozyFS *fs, const char *oldpath, const char *newpath);
@@ -966,8 +980,8 @@ static void perform_backup(CozyFS *fs, int not_before_sec)
 	if (backup == BACKUP_NO)
 		return;
 
-	u64 now = timestamp_utc(fs);
-	if (now < root->last_backup_time + not_before_sec)
+	u64 now = sys_time(fs);
+	if (now < root->last_backup_time + not_before_sec * 1000)
 		return;
 
 	atomic_store(&root->backup, !backup);
@@ -1050,11 +1064,15 @@ static void leave_critical_section(CozyFS *fs)
 		unlock(fs);
 }
 
-void cozyfs_init(void *mem, unsigned long len, int backup)
+int cozyfs_init(void *mem, unsigned long len, int backup, int refresh)
 {
 	// Align to the size of a pointer
 	{
-		// TODO
+		unsigned long pad = -(unsigned long) mem & 7;
+		if (len < pad)
+			return -COZYFS_ENOMEM;
+		mem = (char*) mem + pad;
+		len -= pad;
 	}
 
 	if (backup)
@@ -1062,30 +1080,39 @@ void cozyfs_init(void *mem, unsigned long len, int backup)
 
 	int tot_pages = len / 4096;
 	if (tot_pages == 0)
-		return;
+		return -COZYFS_ENOMEM;
 
 	RPage *root = mem;
-	root->lock = 0;
-	root->backup = backup ? BACKUP_HALF_ACTIVE : BACKUP_NO;
-	root->free_dpages = INVALID_OFFSET;
-	root->free_pages = INVALID_OFFSET;
-	root->tot_pages = tot_pages;
-	root->num_pages = 1;
 
-	for (int i = 0; i < COUNT(root->handles); i++) {
-		root->handles[i].gen = 1;
-		root->handles[i].used = 0;
+	if (refresh)
+		atomic_store(&root->lock, 0);
+	else {
+
+		atomic_store(&root->lock, 0);
+		atomic_store(&root->backup, backup ? BACKUP_HALF_ACTIVE : BACKUP_NO);
+		root->dpages = INVALID_OFFSET;
+		root->free_pages = INVALID_OFFSET;
+		root->tot_pages = tot_pages;
+		root->num_pages = 1;
+
+		for (int i = 0; i < COUNT(root->handles); i++) {
+			root->handles[i].gen = 1;
+			root->handles[i].used = 0;
+		}
+
+		if (backup)
+			my_memcpy(root + tot_pages, root, tot_pages * 4096);
 	}
 
-	if (backup)
-		my_memcpy(root + tot_pages, root, tot_pages * 4096);
+	return 0;
 }
 
 void cozyfs_attach(CozyFS *fs, void *mem, cozyfs_callback callback, void *userptr)
 {
 	// Align to the size of a pointer
 	{
-		// TODO
+		unsigned long pad = -(unsigned long) mem & 7;
+		mem = (char*) mem + pad;
 	}
 
 	fs->mem         = mem;

@@ -1,16 +1,31 @@
+#include "cozyfs_http.h"
+
+#include <stdlib.h>
+
+#if defined(_WIN32)
 #include <winsock2.h>
+#define POLL WSAPoll
+#define CLOSE_SOCKET closesocket
+#endif
 
-#include "cozyfs.h"
+#if defined(__linux__)
+#include <poll.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#define POLL poll
+#define CLOSE_SOCKET close
+#endif
 
-// This file implements an HTTP front-end for CozyFS instances.
-// With this, you can access files using a RESTful API.
-//
-// NOTE: This is work in progress!!
+#include "http.h"
 
+// TODO: Use the HTTPServerConfig fields instead
+#define PORT 8080
 #define CONN_TIMEOUT 60
 #define RECV_TIMEOUT 5
 #define SEND_TIMEOUT 5
 #define INPUT_BUFFER_LIMIT (1<<20)
+#define CONNECTION_REUSE_LIMIT 100
 
 typedef struct {
 	char *ptr;
@@ -18,6 +33,9 @@ typedef struct {
 } string;
 
 #define S(X) ((string) {(X), sizeof(X)-1})
+
+#define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
+#define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
 
 typedef struct {
 	int sock_fd;
@@ -30,45 +48,21 @@ typedef struct {
 	int   output_count;
 	int   output_capacity;
 
+	int response_offset;
+	int state;
 	int error;
+	int minor;
+	int keep_alive;
+	int content_offset;
+	int content_length_value_offset;
+
+	int num_requests;
 	int close_when_flushed;
 
 	int accept_time;
 	int last_recv_time;
 	int last_send_time;
 } Connection;
-
-char mem[1<<20];
-CozyFS fs;
-
-int num_conns = 0;
-Connection conns[1<<10];
-
-typedef enum {
-	M_GET,
-	M_HEAD,
-	M_OPTIONS,
-	M_TRACE,
-	M_PUT,
-	M_DELETE,
-	M_POST,
-	M_PATCH,
-	M_CONNECT,
-} Method;
-
-typedef struct {
-	string name;
-	string value;
-} Header;
-
-#define MAX_HEADERS 256
-
-typedef struct {
-	Method method;
-	string path;
-	int num_headers;
-	Header headers[MAX_HEADERS];
-} Request;
 
 static int
 streq_case_insensitive(string a, string b)
@@ -82,7 +76,7 @@ streq_case_insensitive(string a, string b)
 }
 
 static int
-parse_content_length(Request *req)
+parse_content_length(HTTPRequest *req)
 {
 	int i = 0;
 	while (i < req->num_headers && !streq_case_insensitive(req->headers[i].name, S("Content-Length")))
@@ -112,7 +106,7 @@ parse_content_length(Request *req)
 	return result;
 }
 
-static int parse(char *src, int len, Request *req)
+static int parse(char *src, int len, HTTPRequest *req)
 {
 	int i = 0;
 	if (2 < len - i
@@ -195,8 +189,8 @@ static int parse(char *src, int len, Request *req)
 		i++;
 	if (i == len)
 		return -1;
-	req->path.ptr = src + off;
-	req->path.len = i - off;
+	req->path = src + off;
+	req->path_len = i - off;
 
 	if (5 >= len - i
 		|| src[i+0] != ' '
@@ -208,26 +202,24 @@ static int parse(char *src, int len, Request *req)
 		return -1;
 	i += 6;
 
-	int major;
-	int minor;
 	if (2 < len - i
 		&& src[i+0] == '1'
 		&& src[i+1] == '.'
 		&& src[i+2] == '1') {
-		major = 1;
-		minor = 1;
+		req->major = 1;
+		req->minor = 1;
 		i += 3;
 	} else if (2 < len - i
 		&& src[i+0] == '1'
 		&& src[i+1] == '.'
 		&& src[i+2] == '0') {
-		major = 1;
-		minor = 0;
+		req->major = 1;
+		req->minor = 0;
 		i += 3;
 	} else if (2 < len - i
 		&& src[i+0] == '1') {
-		major = 1;
-		minor = 0;
+		req->major = 1;
+		req->minor = 0;
 		i++;
 	} else {
 		return -1;
@@ -268,9 +260,11 @@ static int parse(char *src, int len, Request *req)
 		i += 2;
 
 		if (req->num_headers < COUNT(req->headers)) {
-			req->headers[req->num_headers++] = (Header) {
-				(string) { name, name_len },
-				(string) { value, value_len },
+			req->headers[req->num_headers++] = (HTTPHeader) {
+				name,
+				value,
+				name_len,
+				value_len,
 			};
 		}
 	}
@@ -371,9 +365,20 @@ static void write_bytes_ack(Connection *c, int num)
 	c->output_count += num;
 }
 
+static void write_bytes(Connection *c, string s)
+{
+	int cap;
+	void *ptr = write_bytes_ptr(c, s.len, cap);
+	if (ptr == NULL) return;
+	memcpy(ptr, s.ptr, s.len);
+	write_bytes_ack(c, s.len);
+}
+
 static void write_head(Connection *c, int status)
 {
 	if (c->error) return;
+
+	ASSERT(c->state == 0);
 
 	int   cap;
 	char *dst;
@@ -381,101 +386,104 @@ static void write_head(Connection *c, int status)
 	dst = write_bytes_ptr(c, 1<<9, &cap);
 	if (dst == NULL) return;
 
-	int len = snprintf(dst, cap, "HTTP/1.1 %d %s\r\n", status, status_text(status));
+	int len = snprintf(dst, cap, "HTTP/1.%d %d %s\r\n", c->minor, status, status_text(status));
 	if (len < 0) {
 		c->error = 1;
 		return;
 	}
 	write_bytes_ack(c, len);
+	c->state = 1;
 }
 
-static void process_single_request(Connection *c, Request *req, CozyFS *fs)
+static void write_header(Connection *c, const char *fmt, va_list args)
 {
-	char path[1<<10];
-	if (req->path.len >= sizeof(path)) {
-		// TODO
+	if (c->error) return;
+
+	ASSERT(c->state == 1);
+
+	int cap;
+	char *ptr = write_bytes_ptr(c, 512, cap);
+	if (ptr) {
+		int len = vsnprintf(ptr, cap, fmt, args);
+		if (len < 0 || len+2 > cap)
+			c->error = 1;
+		else {
+			ptr[len+0] = '\r';
+			ptr[len+1] = '\n';
+			write_bytes_ack(c, len+2);
+		}
 	}
-	memcpy(path, req->path.ptr, req->path.len);
-	path[req->path.len] = '\0';
+}
 
-	switch (req->method) {
+static void restart_response(Connection *c)
+{
+	c->output_count = c->response_offset;
+	c->error = 0;
+	c->state = 0;
+}
 
-		case M_TRACE:
-		case M_CONNECT:
-		case M_POST:
-		write_head(c, 405); // 405 Method Not Allowed
-		write_bytes(c, S("Allow: OPTIONS, GET, HEAD, PUT, DELETE, PATCH\r\n"));
-		break;
+static void special_headers(Connection *c)
+{
+	write_bytes(c, S("Content-Length: "));
+	c->content_length_value_offset = c->output_count;
+	write_bytes(c, S("          \r\n")); // Exactly 10 spaces
 
-		case M_OPTIONS:
-		{
-			// TODO
-		}
-		break;
+	if (c->keep_alive)
+		write_bytes(c, S("Connection: Keep-Alive\r\n"));
+	else
+		write_bytes(c, S("Connection: Close\r\n"));
 
-		case M_GET:
-		case M_HEAD:
-		{
-			int fd = cozyfs_open(fs, path);
-			if (fd < 0) {
-				if (fd == -COZYFS_ENOENT) {
-					write_head(c, 404);
-					write_bytes(c, S("Connection: Close\r\n"));
-					write_bytes(c, S("Content-Length: 0\r\n"));
-					write_bytes(c, S("\r\n"));
-				} else {
-					write_head(c, 500);
-					write_bytes(c, S("Connection: Close\r\n"));
-					write_bytes(c, S("Content-Length: 0\r\n"));
-					write_bytes(c, S("\r\n"));
-				}
-				return;
-			}
+	write_bytes(c, S("\r\n"));
+	c->content_offset = c->output_count;
+}
 
-			write_head(c, 200);
-			write_bytes(c, S("Connection: Keep-Alive\r\n"));
-			write_bytes(c, S("Content-Length: ???\r\n"));
-			write_bytes(c, S("Content-Type: text/plain\r\n"));
-			write_bytes(c, S("\r\n"));
-			for (;;) {
+static void *write_body_ptr(Connection *c, int mincap, int *cap)
+{
+	if (c->error) return;
 
-				int cap;
-				char * dst = write_bytes_ptr(c, 1<<9, &cap);
-				if (dst == NULL) return;
+	ASSERT(c->state == 1 || c->state == 2);
 
-				int num = cozyfs_read(fs, fd, dst, cap, 0);
-				if (num < 0) {
-					// TODO
-				}
-				if (num == 0)
-					break;
-
-				write_bytes_ack(c, num);
-			}
-
-			// TODO
-		}
-		break;
-
-		case M_PUT:
-		{
-			// TODO
-		}
-		break;
-
-		case M_DELETE:
-		{
-			// TODO
-		}
-		break;
-
-		case M_PATCH:
-		{
-			// TODO
-		}
-		break;
+	if (c->state == 1) {
+		special_headers(c);
+		c->state = 2;
 	}
 
+	return write_bytes_ptr(c, mincap, cap);
+}
+
+static void write_body_ack(Connection *c, int num)
+{
+	write_bytes_ack(c, num);
+}
+
+static void write_body(Connection *c, string s)
+{
+	int cap;
+	void *ptr = write_body_ptr(c, s.len, &cap);
+	if (ptr == NULL) return;
+	memcpy(ptr, s.ptr, s.len);
+	write_body_ack(c, s.len);
+}
+
+static void write_end(Connection *c)
+{
+	if (c->error) {
+		restart_response(c);
+		write_head(c, 500);
+	}
+
+	if (c->state == 1) {
+		special_headers(c);
+		c->state = 2;
+	}
+
+	// TODO
+
+	c->state = 3;
+}
+
+static void process_single_request(Connection *c, HTTPRequest *req, void *userptr)
+{
 	// TODO
 }
 
@@ -493,7 +501,7 @@ static int process_queued_requests(Connection *c, CozyFS *fs)
 		char *head = c->input_buffer;
 		int head_len = k + 4;
 
-		Request req;
+		HTTPRequest req;
 		int code = parse(head, head_len, &req);
 		if (code < 0) {
 			write_head(c, 400);
@@ -502,6 +510,12 @@ static int process_queued_requests(Connection *c, CozyFS *fs)
 			write_bytes(c, S("\r\n"));
 			c->close_when_flushed = 1;
 			return 0;
+		}
+
+		if (req.major != 1 || (req.minor != 1 && req.minor != 0)) {
+			// TODO: 505 HTTP Version Not Supported
+			ASSERT(0);
+			return;
 		}
 
 		int content_len = parse_content_length(&req);
@@ -517,15 +531,32 @@ static int process_queued_requests(Connection *c, CozyFS *fs)
 		int total_len = head_len + content_len;
 		if (total_len > c->input_count) break;
 
+		// Prepare connection for responding
+		c->response_offset = c->output_count;
+		c->error = 0;
+		c->state = 0;
+		c->minor = req.minor;
+		c->keep_alive = 1;
+		if (num_conns * 10 >= COUNT(conns) * 7)
+			c->keep_alive = 0;
+		if (c->num_requests >= CONNECTION_REUSE_LIMIT)
+			c->keep_alive = 0;
+		if (req.minor == 0)
+			c->keep_alive = 0;
+		c->content_offset = -1;
+		c->content_length_value_offset = -1;
+
 		process_single_request(c, &req, fs);
-		if (c->error) {
-			write_head(c, 500);
-			write_bytes(c, S("Connection: Close\r\n"));
-			write_bytes(c, S("Content-Length: 0\r\n"));
-			write_bytes(c, S("\r\n"));
+		write_end(c); // Make sure this is called
+		if (c->error)
+			return 1;
+
+		c->num_requests++;
+		if (c->keep_alive == 0)
 			c->close_when_flushed = 1;
-			return 0;
-		}
+
+		if (c->close_when_flushed)
+			break;
 
 		memcpy(c->input_buffer,
 			c->input_buffer + total_len,
@@ -604,15 +635,10 @@ static int timeout_of(Connection *c)
 	return timeout_ms;
 }
 
-int main(int argc, char **argv)
+static int serve(const char *addr, int port)
 {
-	int code;
-
-	code = cozyfs_init(mem, sizeof(mem), 9, 0);
-	if (code < 0)
+	if (port < 0 || port >= 1<<16)
 		return -1;
-
-	cozyfs_attach(&fs, mem, callback, NULL);
 
 	int accept_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (accept_fd < 0)
@@ -620,19 +646,23 @@ int main(int argc, char **argv)
 
 	// TODO: Make accept_fd non-blocking
 
-	unsigned short port = 8080;
-
 	struct sockaddr_in bind_buf;
 	bind_buf.sin_family = AF_INET;
 	bind_buf.sin_port = htons(port);
-	bind_buf.sin_addr.s_addr = htonl(INADDR_ANY);
-	code = bind(accept_fd, (struct sockaddr*) &bind_buf, sizeof(bind_buf));
+	bind_buf.sin_addr.s_addr = inet_addr(addr);
+	int code = bind(accept_fd, (struct sockaddr*) &bind_buf, sizeof(bind_buf));
 	if (code < 0)
 		return -1;
 
 	code = listen(accept_fd, 32);
 	if (code < 0)
 		return -1;
+
+	int num_conns = 0;
+	Connection conns[1<<10];
+
+	for (int i = 0; i < COUNT(conns); i++)
+		conns[i].sock_fd = -1;
 
 	for (;;) {
 
@@ -656,7 +686,7 @@ int main(int argc, char **argv)
 
 		pollarr[pollnum++] = (struct pollfd) { .fd=accept_fd, .events=POLLIN, .revents=0 };
 
-		int num = WSAPoll(pollarr, pollnum, timeout_ms);
+		int num = POLL(pollarr, pollnum, timeout_ms);
 		if (num < 0) continue;
 
 		int current_time = ???;
@@ -665,7 +695,7 @@ int main(int argc, char **argv)
 			while (num_conns < COUNT(conns)) {
 
 				int i = 0;
-				while (conns[i].sock_fd >= 0)
+				while (conns[i].sock_fd != -1)
 					i++;
 
 				int client_fd = accept(accept_fd, NULL, NULL);
@@ -685,6 +715,8 @@ int main(int argc, char **argv)
 				c->output_buffer = NULL;
 				c->output_count = 0;
 				c->output_capacity = 0;
+				c->num_requests = 0;
+				c->state = 0;
 				c->error = 0;
 				c->close_when_flushed = 0;
 				c->accept_time = current_time;
@@ -707,14 +739,14 @@ int main(int argc, char **argv)
 			if (!remove && (pollitem->revents & POLLIN)) {
 				remove = recv_from_conn(c);
 				if (!remove)
-					remove = process_queued_requests(c, fs);
+					remove = process_queued_requests(c);
 			}
 
 			if (!remove && (pollitem->revents & POLLOUT))
 				remove = send_to_conn(c);
 
 			if (remove) {
-				close(c->sock_fd);
+				CLOSE_SOCKET(c->sock_fd);
 				free(c->input_buffer);
 				free(c->output_buffer);
 				c->sock_fd = -1;
@@ -722,6 +754,139 @@ int main(int argc, char **argv)
 		}
 	}
 
-	close(accept_fd);
-	return 0;
+	CLOSE_SOCKET(accept_fd);
+}
+
+//////////////////////////////////////////////////////////////////
+
+int http_serve(HTTPServerConfig config, HTTPCallback callback, void *userptr)
+{
+	return serve(addr, port, ???);
+}
+
+void http_write_head(HTTPResponse *res, int status)
+{
+	write_head((Connection*) res, status);
+}
+
+void http_write_header(HTTPResponse *res, const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	write_head((Connection*) res, args);
+	va_end(args);
+}
+
+void http_write_body(HTTPResponse *res, const char *str, int len)
+{
+	write_body(res, (string) {str, len});
+}
+
+void *http_write_body_ptr(HTTPResponse *res, int mincap, int *cap)
+{
+	return write_body_ptr((Connection*) res, mincap, cap);
+}
+
+void http_write_body_ack(HTTPResponse *res, int num)
+{
+	write_body_ack((Connection*) res, num);
+}
+
+void http_restart_response(HTTPResponse *res)
+{
+	restart_response((Connection*) res);
+}
+
+//////////////////////////////////////////////////////////////////
+
+static void http_callback(HTTPRequest *req, HTTPResponse *res, void *userptr)
+{
+	CozyFS *fs = userptr;
+
+	char path[1<<10];
+	if (req->path_len >= sizeof(path)) {
+		http_write_head(res, 500);
+		return;
+	}
+	memcpy(path, req->path, req->path_len);
+	path[req->path_len] = '\0';
+
+	switch (req->method) {
+
+		case M_TRACE:
+		case M_CONNECT:
+		case M_POST:
+		http_write_head(res, 405); // 405 Method Not Allowed
+		http_write_header(res, "Allow: OPTIONS, GET, HEAD, PUT, DELETE, PATCH");
+		break;
+
+		case M_OPTIONS:
+		http_write_head(res, 200); // 200 OK
+		http_write_header(res, "Allow: OPTIONS, GET, HEAD, PUT, DELETE, PATCH");
+		break;
+
+		case M_GET:
+		{
+			int fd = cozyfs_open(fs, path);
+			if (fd < 0) {
+				http_write_head(res, fd == -COZYFS_ENOENT ? 404 : 500);
+				return;
+			}
+
+			http_write_head(res, 200);
+			for (;;) {
+
+				int cap;
+				char * dst = http_write_body_ptr(res, 1<<9, &cap);
+				if (dst)
+					break;
+
+				int num = cozyfs_read(fs, fd, dst, cap, 0);
+				if (num < 0) {
+					http_restart_response(res);
+					http_write_head(res, 500);
+					return;
+				}
+				if (num == 0)
+					break;
+
+				http_write_body_ack(res, num);
+			}
+
+			cozyfs_close(fs, fd);
+		}
+		break;
+
+		case M_HEAD:
+		{
+			// TODO
+		}
+
+		case M_PUT:
+		{
+			// TODO
+		}
+		break;
+
+		case M_DELETE:
+		{
+			cozyfs_unlink(fs, path);
+			// TODO
+		}
+		break;
+
+		case M_PATCH:
+		{
+			// TODO
+		}
+		break;
+	}
+}
+
+int cozyfs_http_serve(const char *addr, int port, CozyFS *fs)
+{
+	HTTPServerConfig config = HTTP_SERVER_DEFAULT_CONFIG;
+	config.addr = addr;
+	config.port = port;
+	return http_serve(config, http_callback, fs);
 }

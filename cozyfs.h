@@ -39,6 +39,13 @@ enum {
 };
 
 enum {
+	COZYFS_OWNER_READ  = 1 << 0,
+	COZYFS_OWNER_WRITE = 1 << 1,
+	COZYFS_OTHER_READ  = 1 << 2,
+	COZYFS_OTHER_WRITE = 1 << 3,
+};
+
+enum {
 	COZYFS_FCONSUME = 1 << 0,
 };
 
@@ -63,6 +70,7 @@ typedef struct {
 	const void*        mem;
 	void*              userptr;
 	cozyfs_callback    callback;
+	unsigned int       user;
 	unsigned long long ticket;
 	int                transaction;
 	int                patch_count;
@@ -70,23 +78,32 @@ typedef struct {
 	void*              patch_ptrs[COZYFS_MAX_PATCHES];
 } CozyFS;
 
-int  cozyfs_init(void *mem, unsigned long len, int backup, int refresh);
-void cozyfs_attach(CozyFS *fs, void *mem, cozyfs_callback callback, void *userptr);
-void cozyfs_idle(CozyFS *fs);
+unsigned long long cozyfs_callback_impl(int sysop, void *userptr, void *p, int n);
 
-int  cozyfs_link(CozyFS *fs, const char *oldpath, const char *newpath);
-int  cozyfs_unlink(CozyFS *fs, const char *path);
+int  cozyfs_init   (void *mem, unsigned long len, int backup, int refresh);
+void cozyfs_attach (CozyFS *fs, void *mem, const char *user, cozyfs_callback callback, void *userptr);
+void cozyfs_idle   (CozyFS *fs);
 
-int  cozyfs_mkdir(CozyFS *fs, const char *path);
-int  cozyfs_rmdir(CozyFS *fs, const char *path);
+int  cozyfs_link   (CozyFS *fs, const char *oldpath, const char *newpath);
+int  cozyfs_unlink (CozyFS *fs, const char *path);
 
-int  cozyfs_transaction_begin(CozyFS *fs, int lock);
-int  cozyfs_transaction_commit(CozyFS *fs);
-int  cozyfs_transaction_rollback(CozyFS *fs);
+int  cozyfs_mkdir  (CozyFS *fs, const char *path);
+int  cozyfs_rmdir  (CozyFS *fs, const char *path);
 
-int  cozyfs_open(CozyFS *fs, const char *path);
-int  cozyfs_close(CozyFS *fs, int fd);
+int  cozyfs_mkusr  (CozyFS *fs, const char *name);
+int  cozyfs_rmusr  (CozyFS *fs, const char *name);
 
-int  cozyfs_read(CozyFS *fs, int fd, void *dst, int max, int flags);
+int  cozyfs_chown  (CozyFS *fs, const char *path, const char *newowner);
+int  cozyfs_chmod  (CozyFS *fs, const char *path, int mode);
+
+int  cozyfs_open   (CozyFS *fs, const char *path);
+int  cozyfs_close  (CozyFS *fs, int fd);
+
+int  cozyfs_read   (CozyFS *fs, int fd, void       *dst, int max);
+int  cozyfs_write  (CozyFS *fs, int fd, const void *src, int len);
+
+int  cozyfs_transaction_begin    (CozyFS *fs, int lock);
+int  cozyfs_transaction_commit   (CozyFS *fs);
+int  cozyfs_transaction_rollback (CozyFS *fs);
 
 #endif // COZYFS_H

@@ -53,7 +53,7 @@ typedef long long          s64;
 
 #define NULL ((void*) 0)
 
-#define COUNT(X) sizeof(X)/sizeof((X)[0])
+#define COUNT(X) ((int) (sizeof(X)/sizeof((X)[0])))
 
 #define OFFSETOF(TYPE, MEMBER) (((TYPE*) 0)->MEMBER)
 #define MEMBER_SIZEOF(TYPE, MEMBER) sizeof(((TYPE*) 0)->MEMBER)
@@ -78,7 +78,6 @@ enum {
 enum {
 	TRANSACTION_OFF,
 	TRANSACTION_ON,
-	TRANSACTION_ON_WITH_LOCK,
 	TRANSACTION_TIMEOUT,
 };
 
@@ -92,6 +91,8 @@ typedef struct {
 	Offset off;
 	u8     name[128];
 } Link;
+STATIC_ASSERT(sizeof(Link) == 132);
+
 #define MAX_NAME MEMBER_SIZEOF(Link, name)
 
 typedef struct {
@@ -103,6 +104,10 @@ typedef struct {
 	u16    head_start;
 	u16    tail_end;
 } Entity;
+STATIC_ASSERT(sizeof(Entity) == 24);
+
+// 4072
+// 24+132=156
 
 typedef struct {
 
@@ -117,14 +122,14 @@ typedef struct {
 	Offset next;
 
 	// List of links for this directory
-	Link links[28];
+	Link links[26];
 
 	// List of entities. This may or may not be associated
 	// to the directory
-	Entity ents[28];
+	Entity ents[26];
 
 	// Make sure the page struct is 4K
-	char pad[56];
+	char pad[16];
 
 } DPage;
 STATIC_ASSERT(sizeof(DPage) == 4096);
@@ -147,10 +152,11 @@ typedef struct {
 	Offset entity;
 	Offset cursor;
 } Handle;
+STATIC_ASSERT(sizeof(Handle) == 12);
 
 typedef struct {
 	Offset next;
-	Handle handles[8];
+	Handle handles[341];
 } HPage;
 STATIC_ASSERT(sizeof(HPage) == 4096);
 
@@ -158,12 +164,16 @@ typedef struct {
 	u16    id; // Zero if unused
 	char   name[30];
 } User;
+STATIC_ASSERT(sizeof(User) == 32);
+
+#define MAX_USER_NAME MEMBER_SIZEOF(User, name)
 
 typedef struct {
 	u32    gen;
 	Offset prev;
 	Offset next;
-	User   users[1];
+	User   users[127];
+	char   pad[20];
 } UPage;
 STATIC_ASSERT(sizeof(UPage) == 4096);
 
@@ -191,18 +201,26 @@ typedef struct {
 
 	Entity root;
 
-	Handle handles[8];
+	Handle handles[333];
+
+	char pad[8];
 } RPage;
 STATIC_ASSERT(sizeof(RPage) == 4096);
 
 typedef struct {
 	Offset next;
-	char pad[];
+	char   pad[4092];
 } XPage;
 STATIC_ASSERT(sizeof(XPage) == 4096);
 
 ////////////////////////////////////////////////////////////////////////
 // FILE OVERVIEW
+
+// Basic utilities
+static void         my_memcpy           (void *dst, const void *src, unsigned long len);
+static void         my_memset           (void *dst, char src, unsigned long len);
+static unsigned int my_strlen           (const u8 *str);
+static int          memeq               (const void *p1, const void *p2, int len);
 
 // Atomic operations
 static u64           atomic_load        (volatile u64 *ptr);
@@ -244,17 +262,19 @@ static int           remove_user        (CozyFS *fs, const char *name);
 static int           parse_path         (string path, string *comps, int max);
 static int           pack_fd            (CozyFS *fs, const Handle *handle);
 static const Handle* unpack_fd          (CozyFS *fs, int fd);
-static int           link               (CozyFS *fs, const char *oldpath, const char *newpath);
-static int           unlink             (CozyFS *fs, const char *path);
-static int           mkdir              (CozyFS *fs, const char *path);
-static int           rmdir              (CozyFS *fs, const char *path);
+static int           link_              (CozyFS *fs, const char *oldpath, const char *newpath);
+static int           unlink_            (CozyFS *fs, const char *path);
+static int           mkdir_             (CozyFS *fs, const char *path);
+static int           rmdir_             (CozyFS *fs, const char *path);
 static int           mkusr              (CozyFS *fs, const char *name);
 static int           rmusr              (CozyFS *fs, const char *name);
-static int           open               (CozyFS *fs, const char *path);
-static int           close              (CozyFS *fs, int fd);
+static int           chown_             (CozyFS *fs, const char *path, const char *new_owner);
+static int           chmod_             (CozyFS *fs, const char *path, int mode);
+static int           open_              (CozyFS *fs, const char *path);
+static int           close_             (CozyFS *fs, int fd);
 static string        fpage_bytes        (const Entity *entity, const FPage *fpage);
-static int           read               (CozyFS *fs, int fd, void       *dst, int max);
-static int           write              (CozyFS *fs, int fd, const void *src, int num);
+static int           read_              (CozyFS *fs, int fd, void       *dst, int max);
+static int           write_             (CozyFS *fs, int fd, const void *src, int num);
 
 // File system lock
 static int           lock               (CozyFS *fs, int wait_timeout_ms, int acquire_timeout_sec, int *crash);
@@ -281,9 +301,45 @@ int                  cozyfs_open        (CozyFS *fs, const char *path);
 int                  cozyfs_close       (CozyFS *fs, int fd);
 int                  cozyfs_read        (CozyFS *fs, int fd, void       *dst, int max);
 int                  cozyfs_write       (CozyFS *fs, int fd, const void *src, int num);
-int                  cozyfs_transaction_begin   (CozyFS *fs, int lock);
+int                  cozyfs_transaction_begin   (CozyFS *fs);
 int                  cozyfs_transaction_commit  (CozyFS *fs);
 int                  cozyfs_transaction_rollback(CozyFS *fs);
+
+////////////////////////////////////////////////////////////////////////
+// Basic utilities
+
+static void my_memcpy(void *dst, const void *src, unsigned long len)
+{
+	char *dstc = dst;
+	const char *srcc = src;
+	for (unsigned long i = 0; i < len; i++)
+		dstc[i] = srcc[i];
+}
+
+static void my_memset(void *dst, char src, unsigned long len)
+{
+	char *dstc = dst;
+	for (unsigned long i = 0; i < len; i++)
+		dstc[i] = src;
+}
+
+static unsigned int my_strlen(const u8 *str)
+{
+	if (str == NULL)
+		return 0;
+	unsigned int len = 0;
+	while (str[len] != '\0')
+		len++;
+	return len;
+}
+
+static int memeq(const void *p1, const void *p2, int len)
+{
+	for (int i = 0; i < len; i++)
+		if (((char*) p1)[i] != ((char*) p2)[i])
+			return 0;
+	return 1;
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Atomic operations
@@ -318,9 +374,9 @@ static int atomic_compare_exchange(volatile u64 *ptr, u64 expect, u64 new_value)
 static u64 load(u64 *ptr)
 {
 #if COMPILER_MSVC
-	u64 old_word = *ptr;
+	return = *ptr;
 #else
-	u64 old_word = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+	return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
 #endif
 }
 
@@ -376,7 +432,7 @@ static int sys_wait(CozyFS *fs, u64 *word, u64 old_word, int timeout_ms)
 {
 	int code = fs->callback(COZYFS_SYSOP_WAIT, fs->userptr, ???);
 	if (code != COZYFS_SYSRES_OK)
-		return NULL;
+		return -COZYFS_ESYSWAIT;
 	return COZYFS_OK;
 }
 
@@ -384,7 +440,7 @@ static int sys_wake(CozyFS *fs, u64 *word)
 {
 	int code = fs->callback(COZYFS_SYSOP_WAKE, fs->userptr, ???);
 	if (code != COZYFS_SYSRES_OK)
-		return NULL;
+		return -COZYFS_ESYSWAKE;
 	return COZYFS_OK;
 }
 
@@ -406,7 +462,7 @@ static u64 sys_time(CozyFS *fs)
 // TODO: Use this instead of accessing the root page directly
 static const RPage *get_root(CozyFS *fs)
 {
-	RPage *root = fs->mem;
+	const RPage *root = fs->mem;
 	if (root->backup == BACKUP_HALF_INACTIVE)
 		root += root->tot_pages;
 	return root;
@@ -452,14 +508,14 @@ static void *writable_addr(CozyFS *fs, const void *ptr)
 
 		// Patch found. Return the pointer as-is
 		if (i < fs->patch_count)
-			return ptr;
+			return (void*) ptr; // Unconst the pointer
 
 		// We need to create a new patch
 		if (fs->patch_count == COUNT(fs->patch_offs))
 			return NULL; // Path limit reached
 
 		// Ask the user for a new page
-		void *page_copy = sys_alloc(fs, 4096);
+		void *page_copy = sys_malloc(fs, 4096);
 		if (page_copy == NULL)
 			return NULL;
 
@@ -477,7 +533,7 @@ static void *writable_addr(CozyFS *fs, const void *ptr)
 		ptr = page_copy + byte_off;
 	}
 
-	return ptr;
+	return (void*) ptr;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -515,7 +571,7 @@ static const Entity *find_entity(CozyFS *fs, const Entity *parent, string name)
 		while (i < COUNT(dpage->links) && dpage->links[i].off != INVALID_OFFSET) {
 
 			int link_name_len = my_strlen(dpage->links[i].name);
-			if (name.size == link_name_len && !my_memcmp(name.data, dpage->links[i].name, name.size))
+			if (name.size == link_name_len && memeq(name.data, dpage->links[i].name, name.size))
 				return off2ptr(fs, dpage->links[i].off);
 			i++;
 		}
@@ -550,13 +606,13 @@ static int create_entity(CozyFS *fs, const Entity *parent, const Entity *target,
 		// TODO: Tail is full
 	}
 
-	DPage *writable_tail = writable_ptr(fs, tail);
+	DPage *writable_tail = writable_addr(fs, tail);
 	if (writable_tail == NULL)
 		return -COZYFS_ENOMEM;
 
 	if (target) {
 
-		Entity *writable_target = writable_ptr(fs, target);
+		Entity *writable_target = writable_addr(fs, target);
 		if (writable_target == NULL)
 			return -COZYFS_ENOMEM;
 
@@ -603,7 +659,7 @@ static int remove_entity(CozyFS *fs, const Entity *parent, string name, u32 flag
 		while (i < COUNT(dpage->links) && dpage->links[i].off != INVALID_OFFSET) {
 
 			int link_name_len = my_strlen(dpage->links[i].name);
-			if (name.size == link_name_len && !my_memcmp(name, dpage->links[i].name, name.size))
+			if (name.size == link_name_len && memeq(name.data, dpage->links[i].name, name.size))
 				return off2ptr(fs, dpage->links[i].off);
 			i++;
 		}
@@ -617,11 +673,11 @@ static int remove_entity(CozyFS *fs, const Entity *parent, string name, u32 flag
 	const Link *link = &dpage->links[i];
 	const Entity *entity = off2ptr(fs, link->off);
 
-	Entity *writable_parent = writable_ptr(fs, parent);
+	Entity *writable_parent = writable_addr(fs, parent);
 	if (writable_parent == NULL)
 		return COZYFS_ENOMEM;
 
-	DPage *writable_dpage = writable_ptr(fs, dpage);
+	DPage *writable_dpage = writable_addr(fs, dpage);
 	if (writable_dpage == NULL)
 		return -COZYFS_ENOMEM;
 
@@ -653,7 +709,7 @@ static void *allocate_page(CozyFS *fs)
 	if (root->free_pages == INVALID_OFFSET) {
 		xpage = (XPage*) get_root(fs) + writable_root->num_pages++;
 	} else {
-		xpage = off2ptr(fs, writable_root->free_pages);
+		xpage = writable_addr(fs, off2ptr(fs, writable_root->free_pages));
 		writable_root->free_pages = xpage->next;
 	}
 
@@ -666,7 +722,7 @@ static int create_user(CozyFS *fs, const char *name)
 {
 	const RPage *root = get_root(fs);
 
-	int name_len = strlen(name);
+	int name_len = my_strlen(name);
 	if (name_len >= MAX_USER_NAME)
 		return -COZYFS_ENAMETOOLONG;
 
@@ -682,11 +738,11 @@ static int create_user(CozyFS *fs, const char *name)
 			return -COZYFS_ENOMEM;
 		upage->prev = writable_root->tail_upage;
 		upage->next = INVALID_OFFSET;
-		writable_root->tail_upage = upage;
+		writable_root->tail_upage = ptr2off(fs, upage);
 		writable_root->tail_upage_used = 0;
 
 	} else
-		upage = root->tail_upage;
+		upage = off2ptr(fs, root->tail_upage);
 
 	RPage *writable_root = writable_addr(fs, root);
 	if (writable_root == NULL)
@@ -694,8 +750,8 @@ static int create_user(CozyFS *fs, const char *name)
 
 	User *user = &upage->users[writable_root->tail_upage_used++];
 	user->id = writable_root->next_account_id++;
-	memset(user->name, 0, MAX_USER_NAME);
-	memcpy(user->name, name, name_len);
+	my_memset(user->name, 0, MAX_USER_NAME);
+	my_memcpy(user->name, name, name_len);
 	return 0;
 }
 
@@ -816,14 +872,16 @@ static const Handle *unpack_fd(CozyFS *fs, int fd)
 
 	const RPage *root = fs->mem;
 	if (idx >= COUNT(root->handles))
-		return -COZYFS_EBADF;
+		return NULL;
 
 	const Handle *handle = &root->handles[idx];
 	if (handle->gen != gen)
-		return -COZYFS_EBADF;
+		return NULL;
+	
+	return handle;
 }
 
-static int link(CozyFS *fs, const char *oldpath, const char *newpath)
+static int link_(CozyFS *fs, const char *oldpath, const char *newpath)
 {
 	string oldpathstr = { oldpath, my_strlen(oldpath) };
 	string newpathstr = { newpath, my_strlen(newpath) };
@@ -863,7 +921,7 @@ static int link(CozyFS *fs, const char *oldpath, const char *newpath)
 	return create_entity(fs, parent, target, newpathcomps[newpathnum-1], ENTITY_FILE);
 }
 
-static int unlink(CozyFS *fs, const char *path)
+static int unlink_(CozyFS *fs, const char *path)
 {
 	string pathstr = { path, my_strlen(path) };
 
@@ -886,7 +944,7 @@ static int unlink(CozyFS *fs, const char *path)
 	return remove_entity(fs, parent, pathcomps[pathnum-1], ENTITY_FILE);
 }
 
-static int mkdir(CozyFS *fs, const char *path)
+static int mkdir_(CozyFS *fs, const char *path)
 {
 	string pathstr = { path, my_strlen(path) };
 
@@ -909,7 +967,7 @@ static int mkdir(CozyFS *fs, const char *path)
 	return create_entity(fs, parent, NULL, pathcomps[pathnum-1], ENTITY_DIR);
 }
 
-static int rmdir(CozyFS *fs, const char *path)
+static int rmdir_(CozyFS *fs, const char *path)
 {
 	string pathstr = { path, my_strlen(path) };
 
@@ -944,17 +1002,17 @@ static int rmusr(CozyFS *fs, const char *name)
 	return remove_user(fs, name);
 }
 
-static int chown(CozyFS *fs, const char *path, const char *new_owner)
+static int chown_(CozyFS *fs, const char *path, const char *new_owner)
 {
 	// TODO
 }
 
-static int chmod(CozyFS *fs, const char *path, int mode)
+static int chmod_(CozyFS *fs, const char *path, int mode)
 {
 	// TODO
 }
 
-static int open(CozyFS *fs, const char *path)
+static int open_(CozyFS *fs, const char *path)
 {
 	string pathstr = { path, my_strlen(path) };
 
@@ -995,7 +1053,7 @@ static int open(CozyFS *fs, const char *path)
 	return pack_fd(fs, handle);
 }
 
-static int close(CozyFS *fs, int fd)
+static int close_(CozyFS *fs, int fd)
 {
 	const Handle *handle = unpack_fd(fs, fd);
 	if (handle == NULL)
@@ -1037,7 +1095,7 @@ static string fpage_bytes(const Entity *entity, const FPage *fpage)
 	return (string) { src, num };
 }
 
-static int read(CozyFS *fs, int fd, void *dst, int max)
+static int read_(CozyFS *fs, int fd, void *dst, int max)
 {
 	const Handle *handle = unpack_fd(fs, fd);
 	if (handle == NULL)
@@ -1088,7 +1146,7 @@ static int read(CozyFS *fs, int fd, void *dst, int max)
 	return copied;
 }
 
-int cozyfs_write(CozyFS *fs, int fd, const void *src, int len)
+static int write_(CozyFS *fs, int fd, const void *src, int len)
 {
 	// TODO
 }
@@ -1117,7 +1175,7 @@ static int lock(CozyFS *fs, int wait_timeout_ms, int acquire_timeout_sec, int *c
 
 		if (old_word < now) {
 			// Region is unlocked. Try locking it.
-			if (cmpxchg_acq(word, new_word, old_word))
+			if (cmpxchg_acquire(word, new_word, old_word))
 				break; // Lock acquired
 			// If we reach this point, probably someone
 			// else got the lock. We don't need to wait
@@ -1147,7 +1205,7 @@ static int unlock(CozyFS *fs)
 {
 	RPage *root = fs->mem;
 	u64   *word = root->lock;
-	if (!cmpxchg_rel(root->lock, 0, fs->ticket))
+	if (!cmpxchg_release(root->lock, 0, fs->ticket))
 		return -COZYFS_ETIMEDOUT;
 	return sys_wake(fs, word); // TODO: Should I only wake up 1?
 }
@@ -1224,11 +1282,11 @@ static int enter_critical_section(CozyFS *fs, int wait_timeout_ms)
 		return -COZYFS_ETIMEDOUT;
 
 	int code;
-	if (fs->transaction == TRANSACTION_ON_WITH_LOCK) {
+	if (fs->transaction == TRANSACTION_ON) {
 
 		code = refresh_lock(fs, 5);
 		if (code != COZYFS_OK) {
-			fs->transaction == TRANSACTION_TIMEOUT;
+			fs->transaction = TRANSACTION_TIMEOUT;
 			return code;
 		}
 
@@ -1262,7 +1320,7 @@ static void leave_critical_section(CozyFS *fs)
 	if (fs->transaction == TRANSACTION_OFF)
 		perform_backup(fs, 3);
 
-	if (fs->transaction != TRANSACTION_ON_WITH_LOCK)
+	if (fs->transaction != TRANSACTION_ON)
 		unlock(fs);
 }
 
@@ -1328,7 +1386,7 @@ void cozyfs_attach(CozyFS *fs, void *mem, const char *user, cozyfs_callback call
 
 void cozyfs_idle(CozyFS *fs)
 {
-	if (fs->transaction == TRANSACTION_ON_WITH_LOCK)
+	if (fs->transaction == TRANSACTION_ON)
 		refresh_lock(fs, 5);
 	perform_backup(fs, 3); // TODO: Do this in the critical section
 }
@@ -1340,7 +1398,7 @@ int cozyfs_link(CozyFS *fs, const char *oldpath, const char *newpath)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = link(fs, oldpath, newpath);
+	code = link_(fs, oldpath, newpath);
 
 	leave_critical_section(fs);
 	return code;
@@ -1353,7 +1411,7 @@ int cozyfs_unlink(CozyFS *fs, const char *path)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = unlink(fs, path);
+	code = unlink_(fs, path);
 
 	leave_critical_section(fs);
 	return code;
@@ -1366,7 +1424,7 @@ int cozyfs_mkdir(CozyFS *fs, const char *path)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = mkdir(fs, path);
+	code = mkdir_(fs, path);
 
 	leave_critical_section(fs);
 	return code;
@@ -1379,7 +1437,7 @@ int cozyfs_rmdir(CozyFS *fs, const char *path)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = rmdir(fs, path);
+	code = rmdir_(fs, path);
 
 	leave_critical_section(fs);
 	return code;
@@ -1418,7 +1476,7 @@ int cozyfs_chown(CozyFS *fs, const char *path, const char *newowner)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = chown(fs, path, newowner);
+	code = chown_(fs, path, newowner);
 
 	leave_critical_section(fs);
 	return code;
@@ -1431,7 +1489,7 @@ int cozyfs_chmod(CozyFS *fs, const char *path, int mode)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = chmod(fs, path, mode);
+	code = chmod_(fs, path, mode);
 
 	leave_critical_section(fs);
 	return code;
@@ -1444,7 +1502,7 @@ int cozyfs_open(CozyFS *fs, const char *path)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = open(fs, path);
+	code = open_(fs, path);
 
 	leave_critical_section(fs);
 	return code;
@@ -1457,7 +1515,7 @@ int cozyfs_close(CozyFS *fs, int fd)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = close(fs, fd);
+	code = close_(fs, fd);
 
 	leave_critical_section(fs);
 	return code;
@@ -1470,7 +1528,7 @@ int cozyfs_read(CozyFS *fs, int fd, void *dst, int max)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = read(fs, fd, dst, max);
+	code = read_(fs, fd, dst, max);
 
 	leave_critical_section(fs);
 	return code;
@@ -1483,24 +1541,26 @@ int cozyfs_write(CozyFS *fs, int fd, const void *src, int len)
 	if (code != COZYFS_OK)
 		return code;
 
-	code = write(fs, fd, src, len);
+	code = write_(fs, fd, src, len);
 
 	leave_critical_section(fs);
 	return code;
 }
 
-int cozyfs_transaction_begin(CozyFS *fs, int lock)
+int cozyfs_transaction_begin(CozyFS *fs)
 {
 	if (fs->transaction != TRANSACTION_OFF)
 		return -COZYFS_EINVAL;
 
-	if (lock) {
-		int code = trylock(fs, 5);
-		if (code != COZYFS_OK)
-			return code;
+	int crash;
+	int code = lock(fs, -1, 5, &crash);
+	if (code != COZYFS_OK)
+		return code;
+	if (crash) {
+		// TODO
 	}
 
-	fs->transaction = lock ? TRANSACTION_ON_WITH_LOCK : TRANSACTION_ON;
+	fs->transaction = TRANSACTION_ON;
 	return COZYFS_OK;
 }
 
@@ -1514,10 +1574,8 @@ int cozyfs_transaction_rollback(CozyFS *fs)
 		sys_free(fs, fs->patch_ptrs[i], 4096);
 	fs->patch_count = 0;
 
-	if (fs->transaction == TRANSACTION_ON_WITH_LOCK)
-		unlock(fs);
+	unlock(fs);
 	fs->transaction = TRANSACTION_OFF;
-
 	return COZYFS_OK;
 }
 
@@ -1536,22 +1594,12 @@ int cozyfs_transaction_commit(CozyFS *fs)
 		return -COZYFS_ETIMEDOUT;
 	}
 
-	if (fs->transaction != TRANSACTION_ON_WITH_LOCK) {
-		int crash;
-		int code = lock(fs, -1, 3, &crash);
-		if (code != COZYFS_OK)
-			return code;
-		if (crash) {
-			// TODO
-		}
-	}
-
 	// TODO: Verify conflicts
 
 	// Apply changes and free patches
 	for (int i = 0; i < fs->patch_count; i++) {
 		void *src = fs->patch_ptrs[i];
-		void *dst = fs->patch_offs[i] + fs->mem;
+		void *dst = (void*) (fs->patch_offs[i] + fs->mem);
 		my_memcpy(dst, src, 4096);
 		sys_free(fs, src, 4096);
 	}
@@ -1559,6 +1607,7 @@ int cozyfs_transaction_commit(CozyFS *fs)
 
 	perform_backup(fs, 0);
 	unlock(fs);
+	fs->transaction = TRANSACTION_OFF;
 	return COZYFS_OK;
 }
 
@@ -1585,6 +1634,8 @@ static int wake(u64 *word)
 unsigned long long
 cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 {
+	(void) userptr;
+
 	switch (sysop) {
 
 		case COZYFS_SYSOP_MALLOC:
@@ -1628,6 +1679,7 @@ cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 // Linux callback
 #if OS_LINUX
 
+#include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -1649,7 +1701,7 @@ static int wait(u64 *word, u64 old_word, int timeout_ms)
 	if (timeout_ms < 0)
 		tsptr = NULL;
 	else {
-		ts.tv_sec = timeout_ms * / 1000;
+		ts.tv_sec = timeout_ms / 1000;
 		ts.tv_nsec = (timeout_ms % 1000) * 1000000;
 	}
 
@@ -1669,17 +1721,18 @@ static int wake(u64 *word)
 	return 0;
 }
 
-unsigned long long
-cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
+u64 cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 {
+	(void) userptr;
+
 	switch (sysop) {
 
 		case COZYFS_SYSOP_MALLOC:
 		{
 			void *addr = mmap(NULL, n, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 			if (*addr == MAP_FAILED)
-				return NULL;
-			return addr;
+				return 0;
+			return (u64) addr;
 		}
 		break;
 

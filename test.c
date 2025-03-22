@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include "cozyfs_core.h"
+#include "cozyfs.h"
 
 #define TEST_START do { char mem[1<<16]; CozyFS fs; cozyfs_init(mem, sizeof(mem), 0, 0); cozyfs_attach(&fs, mem, (void*) 0, cozyfs_callback_impl, (void*) 0);
 #define TEST_END } while (0);

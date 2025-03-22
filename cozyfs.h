@@ -31,11 +31,14 @@ enum {
 	COZYFS_EISDIR,
 	COZYFS_ENFILE,
 	COZYFS_EBADF,
+	COZYFS_ENAMETOOLONG,
 	COZYFS_ETIMEDOUT,
 	COZYFS_ECORRUPT,
 	COZYFS_ESYSFREE,
 	COZYFS_ESYSSYNC,
 	COZYFS_ESYSTIME,
+	COZYFS_ESYSWAIT,
+	COZYFS_ESYSWAKE,
 };
 
 enum {
@@ -102,7 +105,7 @@ int  cozyfs_close  (CozyFS *fs, int fd);
 int  cozyfs_read   (CozyFS *fs, int fd, void       *dst, int max);
 int  cozyfs_write  (CozyFS *fs, int fd, const void *src, int len);
 
-int  cozyfs_transaction_begin    (CozyFS *fs, int lock);
+int  cozyfs_transaction_begin    (CozyFS *fs);
 int  cozyfs_transaction_commit   (CozyFS *fs);
 int  cozyfs_transaction_rollback (CozyFS *fs);
 

@@ -1618,19 +1618,6 @@ int cozyfs_transaction_commit(CozyFS *fs)
 #define WIN32_MEAN_AND_LEAN
 #include <windows.h>
 
-static int wait(u64 *word, u64 old_word, int timeout_ms)
-{
-	if (!WaitOnAddress((volatile VOID*) word, (PVOID) &old_word, sizeof(u64), timeout_ms < 0 ? INFINITE: (DWORD) timeout_ms))
-		return -EAGAIN;
-	return 0;
-}
-
-static int wake(u64 *word)
-{
-	WakeByAddressAll((PVOID) word);
-	return 0;
-}
-
 unsigned long long
 cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 {
@@ -1639,19 +1626,36 @@ cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 	switch (sysop) {
 
 		case COZYFS_SYSOP_MALLOC:
-		return VirtualAlloc(NULL, n, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+		{
+			return VirtualAlloc(NULL, n, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+		}
+		break;
 
 		case COZYFS_SYSOP_FREE:
-		return VirtualFree(p, n, MEM_RELEASE);
+		{
+			return VirtualFree(p, n, MEM_RELEASE);
+		}
+		break;
 
 		case COZYFS_SYSOP_WAIT:
+		{
+			if (!WaitOnAddress((volatile VOID*) word, (PVOID) &old_word, sizeof(u64), timeout_ms < 0 ? INFINITE: (DWORD) timeout_ms))
+				return -EAGAIN;
+			return 0;
+		}
 		break;
 
 		case COZYFS_SYSOP_WAKE:
+		{
+			WakeByAddressAll((PVOID) word);
+			return 0;
+		}
 		break;
 
 		case COZYFS_SYSOP_SYNC:
-		// We aren't backing the file system with a file, so we don't need this
+		{
+			// TODO
+		}
 		break;
 
 		case COZYFS_SYSOP_TIME:
@@ -1683,43 +1687,8 @@ cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <linux/futex.h>
 #define CLOCK_REALTIME 0
-
-static int futex(unsigned int *uaddr,
-	int futex_op, unsigned int val,
-	const struct timespec *timeout,
-	unsigned int *uaddr2, unsigned int val3)
-{
-	return syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
-}
-
-static int wait(u64 *word, u64 old_word, int timeout_ms)
-{
-	struct timespec ts;
-	struct timespec *tsptr;
-
-	if (timeout_ms < 0)
-		tsptr = NULL;
-	else {
-		ts.tv_sec = timeout_ms / 1000;
-		ts.tv_nsec = (timeout_ms % 1000) * 1000000;
-	}
-
-	errno = 0;
-	long ret = futex((unsigned int*) word, FUTEX_WAIT, (unsigned int) old_word, tsptr, NULL, 0);
-	if (ret == -1 && errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT)
-		return -errno;
-	return 0;
-}
-
-static int wake(u64 *word)
-{
-	errno = 0;
-	long ret = futex((unsigned int*) word, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
-	if (ret < 0) return -errno;
-	// TODO: Don't return an error on EAGAIN or EINTR
-	return 0;
-}
 
 u64 cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 {
@@ -1737,22 +1706,72 @@ u64 cozyfs_callback_impl(int sysop, void *userptr, void *p, int n)
 		break;
 
 		case COZYFS_SYSOP_FREE:
-		return !munmap(p, n);
+		{
+			return !munmap(p, n);
+		}
+		break;
 
 		case COZYFS_SYSOP_WAIT:
+		{
+			struct timespec ts;
+			struct timespec *tsptr;
+
+			if (timeout_ms < 0)
+				tsptr = NULL;
+			else {
+				ts.tv_sec = timeout_ms / 1000;
+				ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+			}
+
+			errno = 0;
+			long ret = syscall(
+				SYS_futex,
+				(unsigned int*) word,
+				FUTEX_WAIT,
+				(unsigned int) old_word,
+				tsptr,
+				NULL,
+				0
+			);
+			if (ret == -1 && errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT)
+				return -errno;
+			return 0;
+		}
 		break;
 
 		case COZYFS_SYSOP_WAKE:
+		{
+			errno = 0;
+			long ret = syscall(
+				SYS_futex,
+				(unsigned int*) word,
+				FUTEX_WAKE,
+				INT_MAX,
+				NULL,
+				NULL,
+				0
+			);
+			if (ret < 0)
+				return -errno;
+			// TODO: Don't return an error on EAGAIN or EINTR
+			return 0;
+		}
 		break;
 
 		case COZYFS_SYSOP_SYNC:
-		// We aren't backing the file system with a file, so we don't need this
+		{
+			// TODO
+		}
 		break;
 
 		case COZYFS_SYSOP_TIME:
 		{
 			struct timespec ts;
-			int result = syscall(SYS_clock_gettime, CLOCK_REALTIME, &ts);
+			int result = syscall(
+				SYS_clock_gettime,
+				CLOCK_REALTIME,
+				&ts
+			);
 			if (result)
 				return 0;
 			return ts.tv_sec;

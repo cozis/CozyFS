@@ -1,6 +1,8 @@
 # CozyFS
 CozyFS is a tiny in-memory file system.
 
+(This is an incomplete proof of concept)
+
 # Features
 * Self-contained: It's only 1K lines of C with no dependencies (not even libc)
 * Serialization-friendly: The file system is position independant. You can `memmove` it around and it will keep working. This allows you to share it with processes at different virtual addresses or dump it to a file
